@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <vector>
 #include <type_traits>
+#include <functional>
 
 namespace ParallelGS
 {
@@ -207,6 +208,7 @@ struct GSOptions
 	bool ordered_super_sampling = true; // Prefers ordered grid. Aids debugging.
 	bool super_sampled_textures = false;
 	bool super_sampled_quads = false; // Forces texture supersampling for 2D quads.
+	std::function<void ()> on_compilation_tasks_complete; // Used for saving the pipeline cache early.
 };
 
 // Pragmatic hacks which may or may not be useful.

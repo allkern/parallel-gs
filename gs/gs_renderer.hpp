@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <functional>
 
 namespace ParallelGS
 {
@@ -563,7 +564,9 @@ private:
 	void drain_compilation_tasks_nonblock();
 	void kick_compilation_tasks();
 	std::atomic_bool compilation_tasks_active;
+	std::atomic_uint compilation_tasks_pending;
 	std::vector<std::future<void>> compilation_tasks;
+	std::function<void ()> on_compilation_tasks_complete;
 
 	uint64_t query_timeline(const Vulkan::SemaphoreHolder &sem) const;
 
@@ -590,6 +593,8 @@ private:
 	bool scanout_is_interlaced(const PrivRegisterState &priv, const VSyncInfo &info) const;
 	uint32_t get_target_hierarchical_binning(uint32_t num_primitives, uint32_t coarse_tiles_width, uint32_t coarse_tiles_height) const;
 	void set_hierarchical_binning_subgroup_config(Vulkan::CommandBuffer &cmd, uint32_t hier_factor) const;
+	void set_ubershader_subgroup_config(Vulkan::CommandBuffer &cmd, uint32_t sampling_rate_x_log2,
+	                                    uint32_t sampling_rate_y_log2) const;
 
 	void allocate_upload_indirection(TextureAnalysis &analysis, TextureUpload &upload);
 

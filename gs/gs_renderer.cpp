@@ -580,76 +580,57 @@ void GSRenderer::kick_compilation_tasks()
 		cmd->set_specialization_constant_mask(0xff);
 		cmd->enable_subgroup_size_control(true);
 
-		static const struct
+		for (auto &format : formats)
 		{
-			uint32_t lo, hi;
-		} subgroup_configs[] = {
-			{ 6, 6 },
-			{ 4, 6 },
-			{ 3, 6 },
-			{ 2, 6 },
-		};
-
-		for (auto &subgroup_config : subgroup_configs)
-		{
-			if (device->supports_subgroup_size_log2(true, subgroup_config.lo, subgroup_config.hi))
-				cmd->set_subgroup_size_log2(true, subgroup_config.lo, subgroup_config.hi);
-			else
-				continue;
-
-			for (auto &format : formats)
+			for (auto &flags : variant_flags)
 			{
-				for (auto &flags : variant_flags)
+				for (auto &rates : sampling_rates)
 				{
-					for (auto &rates : sampling_rates)
+					// The subgroup config is part of the pipeline hash, so it must match what the shading pass picks.
+					set_ubershader_subgroup_config(*cmd, rates.sample_x, rates.sample_y);
+
+					for (auto &feedback : feedbacks)
 					{
-						for (auto &feedback : feedbacks)
+						if ((flags & VARIANT_FLAG_FEEDBACK_BIT) != 0)
 						{
-							if ((flags & VARIANT_FLAG_FEEDBACK_BIT) != 0)
-							{
-								if (swizzle_compat_key(feedback.feedback_psm) != swizzle_compat_key(format.color_psm))
-									continue;
-							}
-							else if (feedback.feedback_psm != 0 || feedback.feedback_cpsm != 0)
+							if (swizzle_compat_key(feedback.feedback_psm) != swizzle_compat_key(format.color_psm))
 								continue;
+						}
+						else if (feedback.feedback_psm != 0 || feedback.feedback_cpsm != 0)
+							continue;
 
-							cmd->set_specialization_constant(0, rates.sample_x);
-							cmd->set_specialization_constant(1, rates.sample_y);
-							cmd->set_specialization_constant(2, format.color_psm);
-							cmd->set_specialization_constant(3, format.depth_psm);
-							cmd->set_specialization_constant(4, vram_size - 1);
-							cmd->set_specialization_constant(6, feedback.feedback_psm);
-							cmd->set_specialization_constant(7, feedback.feedback_cpsm);
+						cmd->set_specialization_constant(0, rates.sample_x);
+						cmd->set_specialization_constant(1, rates.sample_y);
+						cmd->set_specialization_constant(2, format.color_psm);
+						cmd->set_specialization_constant(3, format.depth_psm);
+						cmd->set_specialization_constant(4, vram_size - 1);
+						cmd->set_specialization_constant(6, feedback.feedback_psm);
+						cmd->set_specialization_constant(7, feedback.feedback_cpsm);
 
-							uint32_t active_flags =
-									flags | (rates.sample_y ? VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT : 0);
+						uint32_t active_flags =
+								flags | (rates.sample_y ? VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT : 0);
+						cmd->set_specialization_constant(5, active_flags);
+						cmd->extract_pipeline_state(deferred);
+						tasks.push_back(deferred);
+
+						if (rates.sample_y != 0)
+						{
+							active_flags |= VARIANT_FLAG_HAS_TEXTURE_ARRAY_BIT;
 							cmd->set_specialization_constant(5, active_flags);
 							cmd->extract_pipeline_state(deferred);
 							tasks.push_back(deferred);
+						}
 
-							if (rates.sample_y != 0)
-							{
-								active_flags |= VARIANT_FLAG_HAS_TEXTURE_ARRAY_BIT;
-								cmd->set_specialization_constant(5, active_flags);
-								cmd->extract_pipeline_state(deferred);
-								tasks.push_back(deferred);
-							}
-
-							if (rates.sample_x == 0 && rates.sample_y == 0 && can_potentially_super_sample())
-							{
-								cmd->set_specialization_constant(
-									5, flags | VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT);
-								cmd->extract_pipeline_state(deferred);
-								tasks.push_back(deferred);
-							}
+						if (rates.sample_x == 0 && rates.sample_y == 0 && can_potentially_super_sample())
+						{
+							cmd->set_specialization_constant(
+								5, flags | VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT);
+							cmd->extract_pipeline_state(deferred);
+							tasks.push_back(deferred);
 						}
 					}
 				}
 			}
-
-			// If device has wave64, we always use it.
-			if (device->supports_subgroup_size_log2(true, 6, 6))
-				break;
 		}
 
 		device->submit_discard(cmd);
@@ -781,13 +762,14 @@ void GSRenderer::kick_compilation_tasks()
 
 	size_t num_tasks = tasks.size();
 	size_t target_threads = (std::thread::hardware_concurrency() + 1) / 2;
-	size_t tasks_per_thread = num_tasks / target_threads;
+	size_t tasks_per_thread = (num_tasks + target_threads - 1) / target_threads;
+	compilation_tasks_pending = uint32_t(target_threads);
 
 	for (size_t thread_index = 0; thread_index < target_threads; thread_index++)
 	{
 		std::vector<Vulkan::DeferredPipelineCompile> deferred(
-			tasks.data() + thread_index * tasks_per_thread,
-			tasks.data() + std::min<size_t>((thread_index + 1) * tasks_per_thread, tasks.size())
+			tasks.data() + std::min<size_t>(thread_index * tasks_per_thread, num_tasks),
+			tasks.data() + std::min<size_t>((thread_index + 1) * tasks_per_thread, num_tasks)
 		);
 
 		auto async_task = std::async(std::launch::async, [this, moved_tasks = std::move(deferred)]()
@@ -802,6 +784,13 @@ void GSRenderer::kick_compilation_tasks()
 				Vulkan::CommandBuffer::build_compute_pipeline(
 						device, task, Vulkan::CommandBuffer::CompileMode::AsyncThread);
 			}
+
+			// Last thread out notifies, unless we were cancelled.
+			if (compilation_tasks_pending.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+			    compilation_tasks_active && on_compilation_tasks_complete)
+			{
+				on_compilation_tasks_complete();
+			}
 		});
 
 		compilation_tasks.push_back(std::move(async_task));
@@ -809,7 +798,7 @@ void GSRenderer::kick_compilation_tasks()
 }
 
 GSRenderer::GSRenderer(PageTracker &tracker_)
-	: tracker(tracker_), compilation_tasks_active(false)
+	: tracker(tracker_), compilation_tasks_active(false), compilation_tasks_pending(0)
 {
 	timeline_value = 0;
 	timeline_thread = std::thread([this]() {
@@ -888,6 +877,7 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	buffers = {};
 	device = device_;
 	vram_size = options.vram_size;
+	on_compilation_tasks_complete = options.on_compilation_tasks_complete;
 	next_clut_instance = 0;
 	base_clut_instance = 0;
 
@@ -2146,6 +2136,18 @@ void GSRenderer::dispatch_single_sample_heuristic(Vulkan::CommandBuffer &cmd, co
 	cmd.set_specialization_constant_mask(0);
 }
 
+void GSRenderer::set_ubershader_subgroup_config(Vulkan::CommandBuffer &cmd, uint32_t sampling_rate_x_log2,
+                                                uint32_t sampling_rate_y_log2) const
+{
+	uint32_t minimum_subgroup_size_log2 = sampling_rate_x_log2 + sampling_rate_y_log2;
+
+	// Prefer Wave64 if we can get away with it.
+	if (device->supports_subgroup_size_log2(true, 6, 6))
+		cmd.set_subgroup_size_log2(true, 6, 6);
+	else if (device->supports_subgroup_size_log2(true, minimum_subgroup_size_log2, 6))
+		cmd.set_subgroup_size_log2(true, minimum_subgroup_size_log2, 6);
+}
+
 void GSRenderer::set_hierarchical_binning_subgroup_config(Vulkan::CommandBuffer &cmd, uint32_t hier_factor) const
 {
 	const bool is_hierarchical = hier_factor != 1;
@@ -2609,13 +2611,7 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
 
 	cmd.enable_subgroup_size_control(true);
 
-	uint32_t minimum_subgroup_size_log2 = inst.sampling_rate_x_log2 + inst.sampling_rate_y_log2;
-
-	// Prefer Wave64 if we can get away with it.
-	if (device->supports_subgroup_size_log2(true, 6, 6))
-		cmd.set_subgroup_size_log2(true, 6, 6);
-	else if (device->supports_subgroup_size_log2(true, minimum_subgroup_size_log2, 6))
-		cmd.set_subgroup_size_log2(true, minimum_subgroup_size_log2, 6);
+	set_ubershader_subgroup_config(cmd, inst.sampling_rate_x_log2, inst.sampling_rate_y_log2);
 
 	uint32_t color_psm = inst.fb.frame.desc.PSM;
 	uint32_t depth_psm = inst.fb.z.desc.PSM | ZBUFBits::PSM_MSB;
